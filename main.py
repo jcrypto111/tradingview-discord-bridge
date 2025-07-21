@@ -1,0 +1,414 @@
+#!/usr/bin/env python3
+"""
+🎯 TRADINGVIEW TO DISCORD BRIDGE - CLOUD VERSION
+Your Discord webhook: https://discord.com/api/webhooks/1395631477831761931/8gvnWGLbdxu7eLBt27imwTgdtTno3s3uLEDmewHlB-XPXG4MkpamDY6ZUrOVl-G9Lrrc
+Runs automatically in the cloud 24/7!
+"""
+
+from flask import Flask, request, jsonify
+import requests
+import json
+import re
+from datetime import datetime
+import os
+import time
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# 🔧 YOUR DISCORD WEBHOOK - ALREADY CONFIGURED!
+DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1395631477831761931/8gvnWGLbdxu7eLBt27imwTgdtTno3s3uLEDmewHlB-XPXG4MkpamDY6ZUrOVl-G9Lrrc"
+
+# Get port from environment (cloud services set this automatically)
+PORT = int(os.environ.get('PORT', 5000))
+
+# Initialize Flask app
+app = Flask(__name__)
+
+# Store recent alerts to prevent spam
+recent_alerts = {}
+alert_count = 0
+
+def parse_tradingview_message(message: str) -> dict:
+    """Parse TradingView alert message and extract signal info"""
+    
+    # Default values
+    result = {
+        "symbol": "UNKNOWN",
+        "signal_type": "UNKNOWN",
+        "algorithm": "unknown",
+        "price": 0,
+        "timeframe": "unknown",
+        "confidence": 0,
+        "raw_message": message
+    }
+    
+    # Try to parse as JSON first
+    try:
+        if message.strip().startswith('{'):
+            data = json.loads(message)
+            result.update(data)
+            return result
+    except:
+        pass
+    
+    # Parse common TradingView alert patterns
+    message_upper = message.upper()
+    
+    # Extract symbol (common patterns)
+    symbol_patterns = [
+        r'([A-Z]{3,10}USDT?)',  # BTCUSDT, ETHUSDT, etc.
+        r'([A-Z]{3,10}USD)',    # BTCUSD, ETHUSD, etc.
+        r'SYMBOL[:\s]*([A-Z0-9]+)',
+        r'TICKER[:\s]*([A-Z0-9]+)'
+    ]
+    
+    for pattern in symbol_patterns:
+        match = re.search(pattern, message_upper)
+        if match:
+            result["symbol"] = match.group(1)
+            break
+    
+    # Extract signal type
+    if any(word in message_upper for word in ['BUY', 'LONG', 'BULLISH', 'UP', '↑', '🚀']):
+        result["signal_type"] = "BUY"
+    elif any(word in message_upper for word in ['SELL', 'SHORT', 'BEARISH', 'DOWN', '↓', '💥']):
+        result["signal_type"] = "SELL"
+    
+    # Extract algorithm
+    if 'ALGO1' in message_upper or 'ALGORITHM 1' in message_upper:
+        result["algorithm"] = "algo1"
+    elif 'ALGO2' in message_upper or 'ALGORITHM 2' in message_upper:
+        result["algorithm"] = "algo2"
+    elif 'ALGO3' in message_upper or 'ALGORITHM 3' in message_upper:
+        result["algorithm"] = "algo3"
+    
+    # Extract price
+    price_patterns = [
+        r'PRICE[:\s]*\$?([0-9,]+\.?[0-9]*)',
+        r'AT[:\s]*\$?([0-9,]+\.?[0-9]*)',
+        r'\$([0-9,]+\.?[0-9]*)'
+    ]
+    
+    for pattern in price_patterns:
+        match = re.search(pattern, message_upper)
+        if match:
+            try:
+                result["price"] = float(match.group(1).replace(',', ''))
+                break
+            except:
+                pass
+    
+    # Extract timeframe
+    tf_patterns = [
+        r'([0-9]+[MH])',  # 15M, 1H, etc.
+        r'TIMEFRAME[:\s]*([A-Z0-9]+)',
+        r'TF[:\s]*([A-Z0-9]+)'
+    ]
+    
+    for pattern in tf_patterns:
+        match = re.search(pattern, message_upper)
+        if match:
+            result["timeframe"] = match.group(1)
+            break
+    
+    return result
+
+def create_discord_embed(alert_data: dict) -> dict:
+    """Create Discord embed from parsed alert data"""
+    
+    symbol = alert_data.get('symbol', 'UNKNOWN')
+    signal_type = alert_data.get('signal_type', 'UNKNOWN').upper()
+    algorithm = alert_data.get('algorithm', 'unknown')
+    price = alert_data.get('price', 0)
+    timeframe = alert_data.get('timeframe', 'unknown')
+    raw_message = alert_data.get('raw_message', '')
+    
+    # Determine colors and emojis
+    if signal_type == 'BUY':
+        color = 0x00ff00  # Green
+        emoji = "📈"
+        title_emoji = "🚀"
+    elif signal_type == 'SELL':
+        color = 0xff0000  # Red
+        emoji = "📉"
+        title_emoji = "💥"
+    else:
+        color = 0xffff00  # Yellow
+        emoji = "⚪"
+        title_emoji = "⚠️"
+    
+    # Create embed
+    embed = {
+        "title": f"{title_emoji} TradingView {signal_type} Signal",
+        "description": f"{emoji} **{symbol}** - Algorithm {algorithm.upper()}",
+        "color": color,
+        "timestamp": datetime.now().isoformat(),
+        "fields": []
+    }
+    
+    # Add fields
+    if price > 0:
+        embed["fields"].append({
+            "name": "💰 Price",
+            "value": f"${price:,.4f}",
+            "inline": True
+        })
+    
+    if timeframe != 'unknown':
+        embed["fields"].append({
+            "name": "📊 Timeframe",
+            "value": timeframe,
+            "inline": True
+        })
+    
+    embed["fields"].append({
+        "name": "🤖 Algorithm",
+        "value": algorithm.upper(),
+        "inline": True
+    })
+    
+    embed["fields"].append({
+        "name": "📅 Time",
+        "value": f"<t:{int(datetime.now().timestamp())}:R>",
+        "inline": True
+    })
+    
+    # Add raw message if it's useful
+    if len(raw_message) < 200:
+        embed["fields"].append({
+            "name": "📝 Original Alert",
+            "value": f"```{raw_message[:200]}```",
+            "inline": False
+        })
+    
+    embed["footer"] = {
+        "text": "TradingView Multi-Algorithmic Indicator - Cloud Service",
+        "icon_url": "https://tradingview.com/static/images/favicon.ico"
+    }
+    
+    return embed
+
+def send_discord_alert(alert_data: dict) -> bool:
+    """Send alert to Discord webhook"""
+    try:
+        embed = create_discord_embed(alert_data)
+        
+        # Create the payload
+        payload = {
+            "content": f"🎯 **TradingView Alert** - {alert_data.get('symbol', 'UNKNOWN')}",
+            "embeds": [embed]
+        }
+        
+        # Send to Discord
+        response = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
+        
+        if response.status_code == 204:
+            logger.info(f"✅ Discord alert sent: {alert_data.get('symbol')} {alert_data.get('signal_type')}")
+            return True
+        else:
+            logger.error(f"❌ Discord webhook failed: {response.status_code} - {response.text}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"❌ Error sending Discord alert: {e}")
+        return False
+
+def is_duplicate_alert(symbol: str, signal_type: str) -> bool:
+    """Check if this is a duplicate alert within 5 minutes"""
+    key = f"{symbol}_{signal_type}"
+    current_time = time.time()
+    
+    if key in recent_alerts:
+        time_diff = current_time - recent_alerts[key]
+        if time_diff < 300:  # 5 minutes
+            return True
+    
+    recent_alerts[key] = current_time
+    return False
+
+@app.route('/webhook', methods=['POST'])
+def tradingview_webhook():
+    """Main webhook endpoint for TradingView alerts"""
+    global alert_count
+    
+    try:
+        # Get the alert message
+        if request.is_json:
+            data = request.get_json()
+            message = json.dumps(data) if isinstance(data, dict) else str(data)
+        else:
+            message = request.get_data(as_text=True)
+        
+        logger.info(f"📥 Received TradingView alert: {message[:200]}...")
+        
+        # Parse the alert message
+        alert_data = parse_tradingview_message(message)
+        
+        # Check for duplicates
+        symbol = alert_data.get('symbol', 'UNKNOWN')
+        signal_type = alert_data.get('signal_type', 'UNKNOWN')
+        
+        if is_duplicate_alert(symbol, signal_type):
+            logger.info(f"⚠️ Duplicate alert filtered: {symbol} {signal_type}")
+            return jsonify({"status": "duplicate_filtered"}), 200
+        
+        # Send to Discord
+        success = send_discord_alert(alert_data)
+        
+        if success:
+            alert_count += 1
+            return jsonify({"status": "success", "message": "Alert sent to Discord"}), 200
+        else:
+            return jsonify({"status": "error", "message": "Failed to send Discord alert"}), 500
+            
+    except Exception as e:
+        logger.error(f"❌ Webhook error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/test', methods=['GET', 'POST'])
+def test_webhook():
+    """Test endpoint - sends a test alert to Discord"""
+    test_messages = [
+        "BTCUSDT BUY SIGNAL - ALGO1 at $45,234.56 on 15M timeframe",
+        "ETHUSDT SELL SIGNAL - ALGO2 at $3,456.78 on 1H timeframe", 
+        '{"symbol":"BTCUSDT","signal_type":"BUY","algorithm":"algo3","price":45000,"timeframe":"4H"}',
+        "🚀 ALGORITHM 1 BUY: SOLUSDT at $98.76 (15M BOS BULL)",
+        "💥 ALGORITHM 2 SELL: ADAUSDT at $0.8765 (1H BOS BEAR)"
+    ]
+    
+    import random
+    test_message = random.choice(test_messages)
+    
+    alert_data = parse_tradingview_message(test_message)
+    alert_data['symbol'] = 'TESTUSDT'  # Override to avoid duplicate filtering
+    
+    success = send_discord_alert(alert_data)
+    
+    if success:
+        return jsonify({
+            "status": "success", 
+            "message": "🎯 Test alert sent to Discord! Check your Discord channel!",
+            "parsed_data": alert_data
+        }), 200
+    else:
+        return jsonify({"status": "error", "message": "Failed to send test alert"}), 500
+
+@app.route('/status', methods=['GET'])
+def status():
+    """Get webhook status"""
+    return jsonify({
+        "status": "✅ CLOUD SERVICE RUNNING 24/7",
+        "webhook_url": f"Use this in TradingView: {request.url_root}webhook",
+        "test_url": f"{request.url_root}test",
+        "alerts_sent": alert_count,
+        "recent_alerts": len(recent_alerts),
+        "discord_configured": "✅ YES - YOUR WEBHOOK IS READY!",
+        "cloud_service": "✅ RUNNING AUTOMATICALLY",
+        "uptime": "24/7 - No need to keep your computer on!"
+    }), 200
+
+@app.route('/', methods=['GET'])
+def home():
+    """Home page with setup instructions"""
+    webhook_url = f"{request.url_root}webhook"
+    test_url = f"{request.url_root}test"
+    
+    return f'''
+    <html>
+    <head><title>🎯 Your TradingView Cloud Bridge</title></head>
+    <body style="font-family: Arial; margin: 40px; background: #f5f5f5;">
+        <h1>🎯 YOUR TRADINGVIEW CLOUD BRIDGE</h1>
+        <h2 style="color: green;">✅ RUNNING IN THE CLOUD 24/7!</h2>
+        <h3 style="color: blue;">✅ Discord Webhook: CONFIGURED!</h3>
+        <h3 style="color: purple;">☁️ No need to keep your computer on!</h3>
+        
+        <div style="background: white; padding: 20px; border-radius: 8px; margin: 20px 0;">
+            <h3>🧪 FIRST: TEST DISCORD CONNECTION</h3>
+            <p><a href="/test" style="background: #28a745; color: white; padding: 12px 24px; text-decoration: none; border-radius: 8px; font-size: 18px;">🧪 CLICK HERE TO TEST DISCORD</a></p>
+            <p style="color: #666;">This should send a test message to your Discord channel!</p>
+        </div>
+        
+        <div style="background: #e8f5e8; padding: 20px; border-radius: 8px; margin: 20px 0; border: 2px solid #28a745;">
+            <h3>🔗 YOUR TRADINGVIEW WEBHOOK URL:</h3>
+            <p style="font-size: 18px; background: #fff; padding: 15px; border-radius: 8px; border: 2px dashed #28a745; word-break: break-all;">
+                <strong>{webhook_url}</strong>
+            </p>
+            <p style="color: #28a745; font-weight: bold;">👆 COPY THIS URL AND USE IT IN TRADINGVIEW!</p>
+        </div>
+        
+        <div style="background: white; padding: 20px; border-radius: 8px; margin: 20px 0;">
+            <h3>📱 TRADINGVIEW ALERT MESSAGE EXAMPLES:</h3>
+            <pre style="background: #eee; padding: 15px; border-radius: 4px; font-size: 14px;">
+🚀 ALGO1 BUY: {{{{ticker}}}} at {{{{close}}}} ({{{{interval}}}})
+💥 ALGO1 SELL: {{{{ticker}}}} at {{{{close}}}} ({{{{interval}}}})
+🚀 ALGO2 BUY: {{{{ticker}}}} at {{{{close}}}} ({{{{interval}}}})
+💥 ALGO2 SELL: {{{{ticker}}}} at {{{{close}}}} ({{{{interval}}}})
+🚀 ALGO3 BUY: {{{{ticker}}}} at {{{{close}}}} ({{{{interval}}}})
+💥 ALGO3 SELL: {{{{ticker}}}} at {{{{close}}}} ({{{{interval}}}})
+            </pre>
+        </div>
+        
+        <div style="background: white; padding: 20px; border-radius: 8px; margin: 20px 0;">
+            <h3>📋 HOW TO USE:</h3>
+            <ol style="font-size: 16px; line-height: 1.8;">
+                <li><strong>Copy the webhook URL above</strong></li>
+                <li><strong>Go to TradingView</strong> and create an alert</li>
+                <li><strong>Check "Webhook URL"</strong> in the alert settings</li>
+                <li><strong>Paste your webhook URL</strong></li>
+                <li><strong>Use the alert message examples above</strong></li>
+                <li><strong>Create the alert</strong> - it will automatically send to Discord!</li>
+            </ol>
+        </div>
+        
+        <div style="background: white; padding: 20px; border-radius: 8px; margin: 20px 0;">
+            <h3>📊 CLOUD SERVICE STATUS:</h3>
+            <p><strong>Status:</strong> ✅ RUNNING 24/7</p>
+            <p><strong>Discord:</strong> ✅ CONFIGURED</p>
+            <p><strong>Alerts Sent:</strong> {alert_count}</p>
+            <p><strong>Your Computer:</strong> ✅ CAN BE TURNED OFF!</p>
+            <p><a href="/status" style="background: #007bff; color: white; padding: 8px 16px; text-decoration: none; border-radius: 4px;">📊 View Detailed Status</a></p>
+        </div>
+    </body>
+    </html>
+    '''
+
+def test_discord_on_startup():
+    """Test Discord webhook when cloud service starts"""
+    logger.info("🧪 Testing Discord webhook connection on cloud startup...")
+    
+    test_payload = {
+        "content": "☁️ **YOUR TRADINGVIEW CLOUD BRIDGE IS ONLINE!**",
+        "embeds": [{
+            "title": "✅ Cloud Service Started!",
+            "description": "Your TradingView webhook bridge is running in the cloud 24/7!",
+            "color": 0x00ff00,
+            "timestamp": datetime.now().isoformat(),
+            "fields": [
+                {"name": "☁️ Status", "value": "Running automatically in the cloud!", "inline": False},
+                {"name": "🎯 Ready", "value": "Ready to receive TradingView alerts 24/7!", "inline": False},
+                {"name": "💻 Your Computer", "value": "Can be turned off - this runs in the cloud!", "inline": False}
+            ]
+        }]
+    }
+    
+    try:
+        response = requests.post(DISCORD_WEBHOOK, json=test_payload, timeout=10)
+        if response.status_code == 204:
+            logger.info("✅ Cloud Discord webhook test successful!")
+            return True
+        else:
+            logger.error(f"❌ Discord webhook test failed: {response.status_code}")
+            return False
+    except Exception as e:
+        logger.error(f"❌ Discord webhook test error: {e}")
+        return False
+
+# Test Discord connection when cloud service starts
+test_discord_on_startup()
+
+if __name__ == '__main__':
+    logger.info(f"🚀 Starting cloud webhook server on port {PORT}")
+    app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
